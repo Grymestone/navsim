@@ -1,1 +1,1 @@
-# navsim
+# 2D Simulator for NaviGator
