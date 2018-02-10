@@ -4,22 +4,38 @@ from __future__ import division
 import numpy as np
 import rospy
 import matplotlib.pyplot as plt
+import sys
+import tf.transformations as trns
+import os
 
 from geometry_msgs.msg import WrenchStamped, PoseStamped, PointStamped
 from roboteq_msgs.msg import Command
 from nav_msgs.msg import Odometry, OccupancyGrid
 
+import rosbag
+from std_msgs.msg import Int32, String
+
 rospy.set_param('inertia', ([1, 1, 2]))
 rospy.set_param('drag', ([.5, 1, 1]))
 rospy.set_param('mass', 544)
-rospy.set_param('wind', ([1, 1, 1]))
 
 class Navsim():
-	def __init__(self, t=0, pose0=np.array([0, 0, 0]), twist0=np.array([0, 0, 0]), wind=True):
+	def __init__(self, t=0, pose0=np.array([0, 0, 0]), twist0=np.array([0, 0, 0]), wind=None):
+
+		rospy.init_node('2Dsim')
 		self.des_force = np.array([0, 0, 0])
 
-		rospy.Subscriber("/wrench/cmd", WrenchStamped, self.wrench_cb)
-		self.publisher = rospy.Publisher("/ref/2dsim", Odometry, )
+		self.world_frame_id = None
+		self.body_frame_id = None 
+		self.state = None
+		self.get_ref = None
+
+
+		self.subscriber = rospy.Subscriber("/wrench/cmd", WrenchStamped, self.wrench_cb)
+		rospy.Subscriber('/odom', Odometry, self.odom_cb)
+		self.publisher = rospy.Publisher("/ref/2dsim", Odometry, queue_size=1)
+
+
 		# self.force = np.float64([0, 0])
 		# X, Y, and angle in world frame
 		self.pose = np.float64(pose0)
@@ -33,9 +49,10 @@ class Navsim():
 		self.t = t
 		# Wind is a function of time that returns a wrench
 		if wind:
-			self.wind = np.array(rospy.get_param('wind'), dtype=np.float64)
+			self.wind = wind
 		else:
 			self.wind = lambda t: np.zeros(3, dtype=np.float64)
+		rospy.spin()
 
 	def step(self, dt, wrench):
 		s = np.sin(self.pose[2])
@@ -60,22 +77,99 @@ class Navsim():
 		self.force = msg.wrench.force
 		self.torque = msg.wrench.torque
 		# Set desired force and torque as numpy array
-		self.des_force = np.array((force.x, force.y, torque.z))
+		self.des_force = np.array((self.force.x, self.force.y, self.torque.z))
+	# return self.des_force
+
+	def pack_odom(self):
+		"""
+		Converts a state vector into an Odometry message
+		with a given header timestamp.
+		"""
+		msg = Odometry()
+		msg.header.stamp = self.t
+		msg.header.frame_id = self.world_frame_id
+		msg.child_frame_id = self.body_frame_id
+		msg.pose.pose.position.x, msg.pose.pose.position.y = self.pose[0:2]
+		# quat = trns.quaternion_from_euler(0, 0, self.twist)
+		msg.pose.pose.orientation = self.pose[2]
+		msg.twist.twist.linear.x, msg.twist.twist.linear.y = self.twist[0:2]
+		msg.twist.twist.angular.z = self.twist[2]
+		return msg
+
+	def unpack_odom(self, msg):		
+		"""
+		Converts an Odometry message into a state vector.
+
+		"""
+		q = [msg.pose.pose.orientation.x, msg.pose.pose.orientation.y,
+		msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]
+		return np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, trns.euler_from_quaternion(q)[2],
+							msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.angular.z])
+	def odom_cb(self, msg):
+		"""
+		Expects an Odometry message.
+		Stores the current state of the vehicle tracking the plan.
+		Reference frame information is also recorded.
+		Determines if the vehicle is tracking well.
+
+		"""
+		self.world_frame_id = msg.header.frame_id
+		self.body_frame_id = msg.child_frame_id
+		self.state = self.unpack_odom(msg)
+		last_update_time = self.t
+		if self.get_ref is not None and last_update_time is not None:
+			error = np.abs(self.erf(self.get_ref(self.rostime() - last_update_time), self.state))
+			if np.all(error < 2 * np.array(params.real_tol)):
+				self.tracking = True
+			else:
+				self.tracking = False
 if __name__ == '__main__':
 	
 
-	# rospy.Subscriber('/odom', Odometry, odom_callback)
-	# rospy.Subscriber('ros_params', )
+	# Check to see if additional command line argument was passed.
+	# Allows 2D sim to play bags on its own, bag must be in the same directory. Fix this later. 
+
 	# coordinate conversion server
 	# Prep
-
 	poses = []
 	twists = []
 	wrenches = []
 	times = []
 	wind = True
-	navsim = Navsim(pose0=np.array([0, 0, np.pi/2]), wind=wind)
-	duration = 10
+	try:
+		# If the user does pass a bag in, we pull some attributes and run the code. 
+		bag_name = sys.argv[1]
+		bag = rosbag.Bag(bag_name, 'r')
+		start_time = bag.get_start_time()
+		end_time = bag.get_end_time()
+		duration = end_time - start_time
+		# We have to create a subprocess to run the bag and the sim simultaneously. 
+		pid = os.fork()
+		# Parent fork i.e. the simulator. 
+		if pid:
+
+			navsim = Navsim(pose0=np.array([0, 0, np.pi/2]), wind=lambda t: np.array([5, 0, 0]))
+			dt = 0.05
+			# rospy.Publisher('/odom_arb')
+			# Simulate
+			for i in xrange(int(duration/dt)):
+				# Record current
+				poses.append(navsim.pose)
+				twists.append(navsim.twist)
+				times.append(navsim.t)
+				# Increment sim
+				# wrench = controller.compute_wrench(navsim.pose, navsim.twist, goal_pose, goal_twist)
+				navsim.publisher.publish(navsim.pack_odom())
+				wrenches.append(navsim.des_force)
+				navsim.step(dt, wrenches[-1])
+		# Child process i.e. the bag file being played
+		else:
+			rosbag.rosbag_main.play_cmd([bag_name])
+	# If nothing gets passed we continue as normal. 
+	except IndexError:
+		duration = 20
+	
+	navsim = Navsim(pose0=np.array([0, 0, np.pi/2]), wind=lambda t: np.array([5, 0, 0]))
 	dt = 0.05
 	# rospy.Publisher('/odom_arb')
 	# Simulate
@@ -86,7 +180,8 @@ if __name__ == '__main__':
 		times.append(navsim.t)
 		# Increment sim
 		# wrench = controller.compute_wrench(navsim.pose, navsim.twist, goal_pose, goal_twist)
-		wrenches.append(np.array([navsim.des_force[0], navsim.des_force[1], navsim.des_force[2]]))
+		navsim.publisher.publish(navsim.pack_odom())
+		wrenches.append(navsim.des_force)
 		navsim.step(dt, wrenches[-1])
 
 
@@ -94,6 +189,7 @@ if __name__ == '__main__':
 	twists = np.array(twists)
 	wrenches = np.array(wrenches)
 	times = np.array(times)
+	# print(wrenches)
 
 
 	# Figure for individual results
